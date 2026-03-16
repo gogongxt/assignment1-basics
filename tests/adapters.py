@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+from collections import Counter
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
+import regex
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -452,7 +454,9 @@ def run_cross_entropy(
     raise NotImplementedError
 
 
-def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+def run_gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter], max_l2_norm: float
+) -> None:
     """Given a set of parameters, clip their combined gradients to have l2 norm at most max_l2_norm.
 
     Args:
@@ -589,4 +593,80 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # GPT-2 pretokenization pattern
+    GPT2_PATTERN = regex.compile(
+        r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    )
+
+    def pretokenize(text: str) -> list[str]:
+        """Split text into tokens using GPT-2 regex pattern."""
+        return GPT2_PATTERN.findall(text)
+
+    def split_on_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
+        """Split text on special token boundaries."""
+        # Build regex pattern to match any special token
+        pattern = "|".join(map(regex.escape, special_tokens))
+        # Split and keep delimiters
+        parts = regex.split(f"({pattern})", text)
+        return [p for p in parts if p]
+
+    # Step 1: Initialize vocabulary with 256 byte values
+    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+
+    # Add special tokens to vocab
+    special_token_set = set(special_tokens)
+    for tok in special_tokens:
+        vocab[len(vocab)] = tok.encode("utf-8")
+
+    # Step 2: Read and preprocess the training text
+    with open(input_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    # Split on special tokens and pretokenize each part
+    parts = split_on_special_tokens(text, special_tokens)
+    tokens_list: list[list[bytes]] = []
+
+    for part in parts:
+        if part in special_token_set:
+            # Special token: keep as single token
+            tokens_list.append([part.encode("utf-8")])
+        elif part:  # Non-empty non-special text
+            # Regular text: pretokenize and convert to bytes
+            for word in pretokenize(part):
+                # Convert each character to its byte representation
+                tokens_list.append([bytes([b]) for b in word.encode("utf-8")])
+
+    merges: list[tuple[bytes, bytes]] = []
+
+    # Step 3: BPE training loop
+    while len(vocab) < vocab_size:
+        # Count pair frequencies
+        pair_counts: Counter[tuple[bytes, bytes]] = Counter()
+        for tokens in tokens_list:
+            for i in range(len(tokens) - 1):
+                pair = (tokens[i], tokens[i + 1])
+                pair_counts[pair] += 1
+
+        if not pair_counts:
+            break
+
+        # Select highest frequency pair (with lexicographically larger as tiebreaker)
+        best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
+
+        # Create new token by merging
+        new_token = best_pair[0] + best_pair[1]
+        vocab[len(vocab)] = new_token
+        merges.append(best_pair)
+
+        # Update tokens by merging all occurrences of best_pair
+        for tokens in tokens_list:
+            i = 0
+            while i < len(tokens) - 1:
+                if (tokens[i], tokens[i + 1]) == best_pair:
+                    # Merge the pair
+                    tokens[i : i + 2] = [new_token]
+                    # Don't increment i - check if the new token can merge again
+                else:
+                    i += 1
+
+    return vocab, merges
