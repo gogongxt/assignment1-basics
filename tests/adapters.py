@@ -563,7 +563,149 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+
+    class Tokenizer:
+        """BPE Tokenizer implementation."""
+
+        # GPT-2 pretokenization pattern
+        GPT2_PATTERN = regex.compile(
+            r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        )
+
+        def __init__(
+            self,
+            vocab: dict[int, bytes],
+            merges: list[tuple[bytes, bytes]],
+            special_tokens: list[str] | None = None,
+        ):
+            self.vocab = vocab
+            self.merges = merges
+
+            # Build reverse vocab: bytes -> id
+            self.vocab_reverse: dict[bytes, int] = {v: k for k, v in vocab.items()}
+
+            # Build merge rankings (lower = higher priority)
+            self.merge_ranks: dict[tuple[bytes, bytes], int] = {
+                merge: i for i, merge in enumerate(merges)
+            }
+
+            # Handle special tokens
+            self.special_tokens: list[str] = special_tokens or []
+            # Build regex pattern for splitting on special tokens
+            # Sort by length descending to match longer tokens first (handles overlapping tokens)
+            if self.special_tokens:
+                sorted_special_tokens = sorted(
+                    self.special_tokens, key=len, reverse=True
+                )
+                pattern = "|".join(map(regex.escape, sorted_special_tokens))
+                self.special_token_pattern = regex.compile(f"({pattern})")
+            else:
+                self.special_token_pattern = None
+
+        def _pretokenize(self, text: str) -> list[str]:
+            """Split text into tokens using GPT-2 regex pattern."""
+            return self.GPT2_PATTERN.findall(text)
+
+        def _split_on_special_tokens(self, text: str) -> list[str]:
+            """Split text on special token boundaries."""
+            if self.special_token_pattern is None:
+                return [text] if text else []
+
+            parts = self.special_token_pattern.split(text)
+            return [p for p in parts if p]
+
+        def _apply_bpe(self, token_bytes: list[bytes]) -> list[bytes]:
+            """Apply BPE merges to a list of byte tokens."""
+            if len(token_bytes) <= 1:
+                return token_bytes
+
+            while True:
+                # Find the pair with the lowest merge rank (highest priority)
+                best_pair = None
+                best_rank = float("inf")
+
+                for i in range(len(token_bytes) - 1):
+                    pair = (token_bytes[i], token_bytes[i + 1])
+                    if pair in self.merge_ranks:
+                        rank = self.merge_ranks[pair]
+                        if rank < best_rank:
+                            best_rank = rank
+                            best_pair = pair
+
+                if best_pair is None:
+                    break
+
+                # Merge all occurrences of the best pair
+                new_tokens = []
+                i = 0
+                while i < len(token_bytes):
+                    if (
+                        i < len(token_bytes) - 1
+                        and (token_bytes[i], token_bytes[i + 1]) == best_pair
+                    ):
+                        new_tokens.append(token_bytes[i] + token_bytes[i + 1])
+                        i += 2
+                    else:
+                        new_tokens.append(token_bytes[i])
+                        i += 1
+                token_bytes = new_tokens
+
+                if len(token_bytes) <= 1:
+                    break
+
+            return token_bytes
+
+        def encode(self, text: str) -> list[int]:
+            """Encode text to token IDs."""
+            if not text:
+                return []
+
+            all_ids: list[int] = []
+
+            # Split on special tokens first
+            parts = self._split_on_special_tokens(text)
+
+            for part in parts:
+                if not part:
+                    continue
+
+                # Check if this part is a special token
+                if part in self.special_tokens:
+                    # Encode special token directly
+                    part_bytes = part.encode("utf-8")
+                    if part_bytes in self.vocab_reverse:
+                        all_ids.append(self.vocab_reverse[part_bytes])
+                    continue
+
+                # Pretokenize and process each word
+                for word in self._pretokenize(part):
+                    # Convert word to list of single-byte tokens
+                    token_bytes = [bytes([b]) for b in word.encode("utf-8")]
+
+                    # Apply BPE
+                    merged_tokens = self._apply_bpe(token_bytes)
+
+                    # Convert to IDs
+                    for token in merged_tokens:
+                        if token in self.vocab_reverse:
+                            all_ids.append(self.vocab_reverse[token])
+
+            return all_ids
+
+        def decode(self, ids: list[int]) -> str:
+            """Decode token IDs to text."""
+            byte_sequence = b""
+            for token_id in ids:
+                if token_id in self.vocab:
+                    byte_sequence += self.vocab[token_id]
+            return byte_sequence.decode("utf-8", errors="replace")
+
+        def encode_iterable(self, iterable: Iterable[str]) -> Iterable[int]:
+            """Encode an iterable of strings to token IDs (memory efficient)."""
+            for text in iterable:
+                yield from self.encode(text)
+
+    return Tokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
