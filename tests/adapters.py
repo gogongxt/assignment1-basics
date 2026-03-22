@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from collections import Counter
 from collections.abc import Iterable
@@ -10,6 +11,8 @@ import regex
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+from .common import gpt2_bytes_to_unicode
 
 
 def run_linear(
@@ -601,6 +604,58 @@ def get_tokenizer(
                 self.special_token_pattern = regex.compile(f"({pattern})")
             else:
                 self.special_token_pattern = None
+
+        @classmethod
+        def from_files(
+            cls,
+            vocab_filepath: str,
+            merges_filepath: str,
+            special_tokens: list[str] | None = None,
+        ):
+            """Construct a Tokenizer from serialized vocabulary and merges files.
+
+            Args:
+                vocab_filepath: Path to the vocabulary JSON file (GPT-2 format)
+                merges_filepath: Path to the merges text file
+                special_tokens: Optional list of special tokens
+
+            Returns:
+                A Tokenizer instance
+            """
+            # Use GPT-2 byte mapping from common.py
+            byte_encoder = gpt2_bytes_to_unicode()
+            byte_decoder = {v: k for k, v in byte_encoder.items()}
+
+            # Load vocabulary from JSON file
+            with open(vocab_filepath, encoding="utf-8") as f:
+                gpt2_vocab = json.load(f)
+
+            # Convert GPT-2 vocab (unicode strings) to bytes
+            vocab: dict[int, bytes] = {}
+            for token_str, token_id in gpt2_vocab.items():
+                token_bytes = bytes([byte_decoder[ch] for ch in token_str])
+                vocab[token_id] = token_bytes
+
+            # Add special tokens if they don't exist in vocab
+            if special_tokens:
+                existing_bytes = set(vocab.values())
+                for special_token in special_tokens:
+                    special_bytes = special_token.encode("utf-8")
+                    if special_bytes not in existing_bytes:
+                        vocab[len(vocab)] = special_bytes
+
+            # Load merges from text file
+            merges: list[tuple[bytes, bytes]] = []
+            with open(merges_filepath, encoding="utf-8") as f:
+                for line in f:
+                    cleaned_line = line.rstrip()
+                    if cleaned_line and len(cleaned_line.split(" ")) == 2:
+                        token1, token2 = cleaned_line.split(" ")
+                        token1_bytes = bytes([byte_decoder[ch] for ch in token1])
+                        token2_bytes = bytes([byte_decoder[ch] for ch in token2])
+                        merges.append((token1_bytes, token2_bytes))
+
+            return cls(vocab, merges, special_tokens)
 
         def _pretokenize(self, text: str) -> list[str]:
             """Split text into tokens using GPT-2 regex pattern."""
