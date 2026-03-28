@@ -269,7 +269,7 @@ uv run pytest -k test_rmsnorm -v
 
 ---
 
-### 2.4 SwiGLU (Problem: swiglu) - 2分
+### 2.4 SwiGLU / Position-wise Feed-Forward (Problem: positionwise_feedforward) - 2分
 
 **实现adapter**: `tests/adapters.py` 中的 `run_swiglu`
 
@@ -588,6 +588,24 @@ def run_cross_entropy(
 | `test_cross_entropy` | 与PyTorch F.cross_entropy结果一致 (atol=1e-4) |
 |                      | 验证数值稳定性 (输入\*1000)                   |
 
+**公式**:
+
+```
+ℓ_i = -log softmax(o_i)[x_{i+1}]
+```
+
+**要求**:
+
+- 减最大值以数值稳定
+- 抵消log/exp
+- 处理任意batch维度
+
+**Perplexity (困惑度)**:
+
+```
+perplexity = exp(1/m * sum(ℓ_i))
+```
+
 **运行测试**:
 
 ```bash
@@ -596,7 +614,57 @@ uv run pytest -k test_cross_entropy -v
 
 ---
 
-### 3.2 AdamW (Problem: adamw) - 2分
+### 3.2 SGD Optimizer Example - 学习优化器实现
+
+**目的**: 学习如何继承`torch.optim.Optimizer`实现自定义优化器
+
+**示例SGD实现** (学习率衰减版本):
+
+```python
+class SGD(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3):
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        defaults = {"lr": lr}
+        super().__init__(params, defaults)
+
+    def step(self, closure=None):
+        loss = None if closure is None else closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                t = state.get("t", 0)
+                grad = p.grad.data
+                p.data -= lr / math.sqrt(t + 1) * grad
+                state["t"] = t + 1
+        return loss
+```
+
+**关键要点**:
+
+- `__init__`: 接收params和超参数，传给基类构造函数
+- `step`: 遍历param_groups，对每个参数原地更新
+- `self.state[p]`: 存储每个参数的状态
+
+---
+
+### 3.3 Learning Rate Tuning (Problem: learning_rate_tuning) - 1分
+
+**任务**: 在toy SGD示例上测试不同学习率的影响
+
+**提交形式**: 书面回答 (writeup.pdf)
+
+**要求**:
+
+- 使用学习率 1e1, 1e2, 1e3 各运行10次迭代
+- 观察loss是更快下降、更慢下降还是发散
+
+---
+
+### 3.4 AdamW (Problem: adamw) - 2分
 
 **实现adapter**: `tests/adapters.py` 中的 `get_adamw_cls`
 
@@ -626,13 +694,30 @@ uv run pytest -k test_adamw -v
 
 ---
 
-### 3.3 AdamW资源计算 (Problem: adamwAccounting) - 2分
+### 3.5 AdamW资源计算 (Problem: adamwAccounting) - 2分
 
 **提交形式**: 书面回答 (writeup.pdf)
 
+**任务**:
+
+(a) 计算AdamW运行所需峰值内存
+
+- 分解为: 参数、激活、梯度、优化器状态
+- 用batch_size和模型超参数表示
+- 简化考虑的激活组件: Transformer block (RMSNorm, MHA子层, FFN), 最终RMSNorm, 输出embedding, cross-entropy
+
+(b) 对GPT-2 XL形状模型，求最大batch_size (80GB内存限制)
+
+(c) AdamW一步需要多少FLOPs?
+
+(d) Model FLOPs Utilization (MFU) 计算
+
+- 假设50% MFU，A100上训练GPT-2 XL 400K步需要多少天?
+- 假设backward FLOPs是forward的2倍
+
 ---
 
-### 3.4 Cosine Schedule (Problem: learning_rate_schedule) - 2分
+### 3.6 Cosine Schedule (Problem: learning_rate_schedule) - 2分
 
 **实现adapter**: `tests/adapters.py` 中的 `run_get_lr_cosine_schedule`
 
@@ -669,7 +754,7 @@ uv run pytest -k test_get_lr_cosine_schedule -v
 
 ---
 
-### 3.5 Gradient Clipping (Problem: gradient_clipping) - 1分
+### 3.7 Gradient Clipping (Problem: gradient_clipping) - 1分
 
 **实现adapter**: `tests/adapters.py` 中的 `run_gradient_clipping`
 
@@ -698,7 +783,7 @@ uv run pytest -k test_gradient_clipping -v
 
 ---
 
-### 3.6 Data Loading (Problem: data_loading) - 2分
+### 3.8 Data Loading (Problem: data_loading) - 2分
 
 **实现adapter**: `tests/adapters.py` 中的 `run_get_batch`
 
@@ -712,6 +797,23 @@ def run_get_batch(
     """从数据集采样batch"""
     raise NotImplementedError
 ```
+
+**数据格式**:
+
+- 输入: 整数token ID的numpy数组
+- 输出: (x, y) 两个tensor，shape均为(batch_size, context_length)
+- y是x的下一个token (y[i, j] = x[i, j+1])
+
+**大数据集处理**:
+
+- 使用`np.memmap`或`np.load(mmap_mode='r')`延迟加载
+- 避免将整个数据集加载到内存
+- 注意指定正确的dtype (如uint16)
+
+**CPU/MPS设备**:
+
+- CPU: 使用`'cpu'`
+- Apple Silicon: 使用`'mps'`
 
 **pytest测试** (`tests/test_data.py`):
 
@@ -736,7 +838,7 @@ uv run pytest -k test_get_batch -v
 
 ---
 
-### 3.7 Checkpointing (Problem: checkpointing) - 1分
+### 3.9 Checkpointing (Problem: checkpointing) - 1分
 
 **实现adapter**: `tests/adapters.py` 中的 `run_save_checkpoint` 和 `run_load_checkpoint`
 
@@ -773,7 +875,7 @@ uv run pytest -k test_checkpointing -v
 
 ---
 
-### 3.8 训练脚本 (Problem: training_together) - 4分
+### 3.10 训练脚本 (Problem: training_together) - 4分
 
 **提交形式**: 代码 + 实验结果
 
@@ -794,10 +896,29 @@ uv run pytest -k test_checkpointing -v
 
 **要求**:
 
-- 从prompt开始生成
-- 支持temperature采样
-- 支持top-p (nucleus)采样
-- 遇到<|endoftext|>停止
+- 从prompt开始生成 (输入 x\_{1:t}，采样直到遇到 `<|endoftext|>`)
+- 用户可控制最大生成token数
+- Temperature scaling:
+  ```
+  softmax(v, τ)_i = exp(v_i/τ) / Σ exp(v_j/τ)
+  ```
+
+  - τ→0: 最大元素主导，softmax变为one-hot
+- Top-p (nucleus) sampling:
+  ```
+  P(x_{t+1}=i|q) = q_i / Σ_{j∈V(p)} q_j  if i ∈ V(p)
+                  = 0                     otherwise
+  ```
+
+  - V(p)是概率累计≥p的最小token集合
+  - 通过排序后选取实现
+
+**解码公式**:
+
+```
+P(x_{t+1}=i|x_{1:t}) = exp(v_i) / Σ exp(v_j)
+v = TransformerLM(x_{1:t})_t ∈ R^{vocab_size}
+```
 
 ---
 
@@ -805,55 +926,198 @@ uv run pytest -k test_checkpointing -v
 
 **提交形式**: 代码 + 实验日志
 
+**要求**: 创建实验跟踪基础设施，记录梯度步数和墙钟时间对应的loss曲线
+
 ---
 
-### 4.3 Learning Rate Tuning (Problem: learning_rate) - 3分
+### 4.3 TinyStories基准超参数
+
+**固定超参数**:
+
+| 参数           | 值          | 说明                              |
+| -------------- | ----------- | --------------------------------- |
+| vocab_size     | 10000       | 典型值tens到hundreds of thousands |
+| context_length | 256         | 简单数据集可用较短序列            |
+| d_model        | 512         | 比标准768略小，加速               |
+| d_ff           | 1344        | ≈8/3 × d_model, 64的倍数          |
+| RoPE theta     | 10000       |                                   |
+| num_layers     | 4           |                                   |
+| num_heads      | 16          |                                   |
+| total_tokens   | 327,680,000 | batch × steps × context_length    |
+
+**需调试的超参数**: 学习率、warmup、AdamW参数(β₁, β₂, ε)、weight decay
+
+**预期运行时间**: 30-40分钟 (H100)
+
+**模型规模**: ~17M non-embedding parameters
+
+**调试技巧**:
+
+- 先overfit单个minibatch验证实现正确性
+- 使用debugger检查中间tensor形状
+- 监控activation、weight、gradient的norm防止爆炸/消失
+
+---
+
+### 4.4 Learning Rate Tuning (Problem: learning_rate) - 3分 (4 H100 hrs)
 
 **提交形式**: 学习曲线 + 模型
+
+**任务**:
+
+(a) 对学习率进行超参数扫描，报告最终loss (或记录发散情况)
+
+- **提交**: 多个学习率的学习曲线 + 超参数搜索策略说明
+
+(b) 研究"边缘稳定性"——最佳学习率与发散点的关系
+
+- **提交**: 包含至少一个发散run的学习曲线 + 分析
 
 **要求**:
 
 - 验证loss ≤ 1.45 (H100) 或 ≤ 2.00 (CPU/MPS)
-- 分析"边缘稳定性"
+
+**低资源配置 (CPU/MPS)**:
+
+- 总tokens: 40,000,000 (而非327,680,000)
+- batch_size × total_steps × context_length = 32 × 5000 × 256 = 40,960,000
+- M3 Max (36GB RAM): ~36分钟 (MPS), ~1小时22分钟 (CPU)
+- 验证loss约1.80 (step 5000)
+
+**技巧**:
+
+- cosine schedule应在最后一步恰好达到min learning rate
+- MPS上不要使用TF32 (torch.set_float32_matmul_precision)
+- 可用torch.compile加速:
+  - CPU: `model = torch.compile(model)`
+  - MPS: `model = torch.compile(model, backend="aot_eager")`
 
 ---
 
-### 4.4 Batch Size Experiment (Problem: batch_size_experiment) - 1分
+### 4.5 Batch Size Experiment (Problem: batch_size_experiment) - 1分 (2 H100 hrs)
 
-**提交形式**: 学习曲线 + 分析
+**任务**: 从batch_size=1到GPU内存上限，测试不同batch size的影响
 
----
+**提交形式**:
 
-### 4.5 Text Generation (Problem: generate) - 1分
-
-**提交形式**: 生成的文本 (≥256 tokens)
-
----
-
-### 4.6 消融实验 - 4分
-
-| Problem               | 消融内容              |
-| --------------------- | --------------------- |
-| `layer_norm_ablation` | 移除RMSNorm           |
-| `pre_norm_ablation`   | Pre-norm vs Post-norm |
-| `no_pos_emb`          | RoPE vs NoPE          |
-| `swiglu_ablation`     | SwiGLU vs SiLU        |
+- 不同batch size的学习曲线 (必要时重新调学习率)
+- 几句话讨论batch size对训练的影响
 
 ---
 
-### 4.7 OpenWebText Experiment (Problem: main_experiment) - 2分
+### 4.6 Text Generation (Problem: generate) - 1分
+
+**提交形式**: 生成的文本 (≥256 tokens) + 简短评论
+
+**要求**:
+
+- 使用训练好的checkpoint生成文本
+- 可能需要调整temperature、top-p等参数获得流畅输出
+- 评论输出的流畅性 + 影响输出质量的至少两个因素
+
+**TinyStories参考输出** (327M tokens训练):
+
+```
+Once upon a time, there was a pretty girl named Lily. She loved to eat gum, especially the big black one. One day, Lily's mom asked her to help cook dinner...
+```
+
+**低资源配置输出** (40M tokens训练):
+
+```
+Once upon a time, there was a little girl named Sue. Sue had a tooth that she loved very much. It was his best head...
+```
+
+---
+
+### 4.7 消融实验 - 4分 (共4个实验，每个1 H100 hr)
+
+#### 4.7.1 Layer Norm Ablation (Problem: layer_norm_ablation) - 1分
+
+**任务**: 移除所有RMSNorm，观察训练行为
+
+**提交形式**:
+
+- 移除RMSNorm的学习曲线 vs 最佳学习率的学习曲线
+- 几句话评论RMSNorm的影响
+
+#### 4.7.2 Pre-norm vs Post-norm (Problem: pre_norm_ablation) - 1分
+
+**Pre-norm (我们使用的)**:
+
+```
+z = x + MultiHeadSelfAttention(RMSNorm(x))
+y = z + FFN(RMSNorm(z))
+```
+
+**Post-norm (原始Transformer)**:
+
+```
+z = RMSNorm(x + MultiHeadSelfAttention(x))
+y = RMSNorm(z + FFN(z))
+```
+
+**提交形式**: Post-norm vs Pre-norm 学习曲线对比
+
+#### 4.7.3 No Position Embedding (Problem: no_pos_emb) - 1分
+
+**任务**: 完全移除位置嵌入 (RoPE)，观察模型性能
+
+**背景**: 有研究表明causal mask本身可以隐式推断位置信息
+
+**提交形式**: RoPE vs NoPE 学习曲线对比
+
+#### 4.7.4 SwiGLU vs SiLU (Problem: swiglu_ablation) - 1分
+
+**SwiGLU**:
+
+```
+FFN(x) = W2(SiLU(W1 x) ⊙ W3 x), d_ff ≈ 8/3 * d_model
+```
+
+**SiLU (无GLU)**:
+
+```
+FFN_SiLU(x) = W2(SiLU(W1 x)), d_ff = 4 * d_model
+```
+
+**提交形式**:
+
+- 参数量近似匹配的学习曲线对比
+- 几句话讨论发现
+
+---
+
+### 4.8 OpenWebText Experiment (Problem: main_experiment) - 2分 (3 H100 hrs)
 
 **提交形式**: 学习曲线 + 生成文本
 
+**任务**: 用相同的模型架构和训练迭代次数，在OpenWebText上训练
+
+**要求**:
+
+- 描述TinyStories和OpenWebText loss的差异及解释
+- 生成的文本示例 + 流畅性分析
+- 解释为何同样模型和计算量，输出质量不如TinyStories
+
+**注意**: 可能需要重新调参 (学习率、batch size等)
+
 ---
 
-### 4.8 Leaderboard (Problem: leaderboard) - 6分 (可选)
+### 4.9 Leaderboard (Problem: leaderboard) - 6分 (10 H100 hrs, 可选)
 
 **规则**:
 
 - 最多1.5小时H100训练
 - 仅使用OpenWebText数据
 - 验证loss < 5.0
+
+**提交**: https://github.com/stanford-cs336/assignment1-basics-leaderboard
+
+**改进思路**:
+
+- 参考Llama 3、Qwen 2.5等开源模型
+- NanoGPT speedrun repository的优化技巧
+- 权重共享 (tie input/output embeddings) - 需减小embedding初始化std
 
 ---
 
@@ -926,3 +1190,67 @@ uv run pytest -k "rope or attention or transformer"
 - 多头注意力: 单次矩阵乘法处理所有头
 - BPE训练: 增量更新pair counts
 - 预计算RoPE的sin/cos
+
+---
+
+## 问题总表与分值
+
+### 第一部分：BPE分词器 (38分)
+
+| Problem               | 分值 | 类型     |
+| --------------------- | ---- | -------- |
+| unicode1              | 1    | 书面回答 |
+| unicode2              | 3    | 书面回答 |
+| train_bpe             | 15   | 代码实现 |
+| train_bpe_tinystories | 2    | 书面回答 |
+| train_bpe_expts_owt   | 2    | 书面回答 |
+| tokenizer             | 15   | 代码实现 |
+| tokenizer_experiments | 4    | 书面回答 |
+
+### 第二部分：Transformer架构 (24分)
+
+| Problem                      | 分值 | 类型     |
+| ---------------------------- | ---- | -------- |
+| linear                       | 1    | 代码实现 |
+| embedding                    | 1    | 代码实现 |
+| rmsnorm                      | 1    | 代码实现 |
+| positionwise_feedforward     | 2    | 代码实现 |
+| softmax                      | 1    | 代码实现 |
+| rope                         | 2    | 代码实现 |
+| scaled_dot_product_attention | 5    | 代码实现 |
+| multihead_self_attention     | 5    | 代码实现 |
+| transformer_block            | 3    | 代码实现 |
+| transformer_lm               | 3    | 代码实现 |
+| transformer_accounting       | 5    | 书面回答 |
+
+### 第三部分：训练组件 (15分)
+
+| Problem                | 分值 | 类型     |
+| ---------------------- | ---- | -------- |
+| cross_entropy          | 2    | 代码实现 |
+| learning_rate_tuning   | 1    | 书面回答 |
+| adamw                  | 2    | 代码实现 |
+| adamwAccounting        | 2    | 书面回答 |
+| learning_rate_schedule | 2    | 代码实现 |
+| gradient_clipping      | 1    | 代码实现 |
+| data_loading           | 2    | 代码实现 |
+| checkpointing          | 1    | 代码实现 |
+| training_together      | 4    | 代码实现 |
+
+### 第四部分：实验与生成 (23分 + 6分可选)
+
+| Problem               | 分值 | 类型      |
+| --------------------- | ---- | --------- |
+| decoding              | 3    | 代码实现  |
+| experiment_log        | 3    | 代码+日志 |
+| learning_rate         | 3    | 实验      |
+| batch_size_experiment | 1    | 实验      |
+| generate              | 1    | 实验      |
+| layer_norm_ablation   | 1    | 实验      |
+| pre_norm_ablation     | 1    | 实验      |
+| no_pos_emb            | 1    | 实验      |
+| swiglu_ablation       | 1    | 实验      |
+| main_experiment       | 2    | 实验      |
+| leaderboard (可选)    | 6    | 比赛      |
+
+**总分**: 100分 (不含可选) + 6分可选
