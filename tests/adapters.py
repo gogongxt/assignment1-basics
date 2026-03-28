@@ -33,8 +33,9 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
-
-    raise NotImplementedError
+    # y = W @ x^T, where W is [d_out, d_in] and x is [..., d_in]
+    # Result: [..., d_out]
+    return torch.matmul(in_features, weights.T)
 
 
 def run_embedding(
@@ -55,8 +56,8 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    # Lookup embedding for each token id
+    return weights[token_ids]
 
 
 def run_swiglu(
@@ -81,14 +82,24 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    # FFN(x) = W_2(SiLU(W_1 x) ⊙ W_3 x)
+    # W1: [d_ff, d_model], W2: [d_model, d_ff], W3: [d_ff, d_model]
+
+    # W_1 x: [..., d_ff]
+    w1_out = torch.matmul(in_features, w1_weight.T)
+
+    # W_3 x: [..., d_ff]
+    w3_out = torch.matmul(in_features, w3_weight.T)
+
+    # SiLU(W_1 x) ⊙ W_3 x
+    # SiLU(x) = x * sigmoid(x)
+    silu_out = w1_out * torch.sigmoid(w1_out)
+    hidden = silu_out * w3_out
+
+    # W_2(hidden): [..., d_model]
+    output = torch.matmul(hidden, w2_weight.T)
+
+    return output
 
 
 def run_scaled_dot_product_attention(
@@ -109,7 +120,29 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    # Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d_k)) @ V
+    d_k = Q.shape[-1]
+
+    # Compute attention scores: Q @ K^T
+    # Q: [..., queries, d_k], K: [..., keys, d_k]
+    # scores: [..., queries, keys]
+    scores = torch.matmul(Q, K.transpose(-2, -1)) / (d_k**0.5)
+
+    # Apply mask if provided
+    # mask: True = can attend, False = cannot attend
+    if mask is not None:
+        # Set masked positions to -inf
+        scores = scores.masked_fill(~mask, float("-inf"))
+
+    # Apply softmax
+    attn_weights = run_softmax(scores, dim=-1)
+
+    # Multiply by values
+    # attn_weights: [..., queries, keys], V: [..., keys, d_v]
+    # output: [..., queries, d_v]
+    output = torch.matmul(attn_weights, V)
+
+    return output
 
 
 def run_multihead_self_attention(
@@ -143,7 +176,47 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    # d_k = d_v = d_model // num_heads
+    d_k = d_model // num_heads
+
+    # Project Q, K, V in single matrix multiply each
+    # in_features: [..., seq_len, d_model]
+    # q_proj_weight: [d_model, d_model] (d_k * num_heads = d_model)
+    # Q: [..., seq_len, d_model]
+    Q = torch.matmul(in_features, q_proj_weight.T)
+    K = torch.matmul(in_features, k_proj_weight.T)
+    V = torch.matmul(in_features, v_proj_weight.T)
+
+    # Reshape for multi-head attention
+    # in_features: [..., seq_len, d_model] where ... is batch dimensions
+    # We want: [..., num_heads, seq_len, d_k]
+    batch_dims = in_features.shape[:-2]  # All dimensions except seq_len and d_model
+    seq_len = in_features.shape[-2]
+
+    # [..., seq_len, d_model] -> [..., seq_len, num_heads, d_k] -> [..., num_heads, seq_len, d_k]
+    Q = Q.view(*batch_dims, seq_len, num_heads, d_k).transpose(-3, -2)
+    K = K.view(*batch_dims, seq_len, num_heads, d_k).transpose(-3, -2)
+    V = V.view(*batch_dims, seq_len, num_heads, d_k).transpose(-3, -2)
+
+    # Create causal mask (self-attention)
+    # Each position can attend to itself and all previous positions
+    # mask: [seq_len, seq_len] where mask[i, j] = True if j <= i
+    causal_mask = torch.tril(
+        torch.ones(seq_len, seq_len, dtype=torch.bool, device=in_features.device)
+    )
+
+    # Apply scaled dot product attention
+    # The mask will be broadcast to match the batch and head dimensions
+    attn_output = run_scaled_dot_product_attention(Q, K, V, mask=causal_mask)
+
+    # Reshape back: [..., num_heads, seq_len, d_k] -> [..., seq_len, d_model]
+    attn_output = attn_output.transpose(-3, -2).contiguous()
+    attn_output = attn_output.view(*batch_dims, seq_len, d_model)
+
+    # Output projection
+    output = torch.matmul(attn_output, o_proj_weight.T)
+
+    return output
 
 
 def run_multihead_self_attention_with_rope(
@@ -183,7 +256,69 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    # d_k = d_v = d_model // num_heads
+    d_k = d_model // num_heads
+
+    # Project Q, K, V in single matrix multiply each
+    # in_features: [..., seq_len, d_model]
+    # Q: [..., seq_len, d_model]
+    Q = torch.matmul(in_features, q_proj_weight.T)
+    K = torch.matmul(in_features, k_proj_weight.T)
+    V = torch.matmul(in_features, v_proj_weight.T)
+
+    # Reshape for multi-head attention
+    # in_features: [..., seq_len, d_model] where ... is batch dimensions
+    # We want: [..., num_heads, seq_len, d_k]
+    batch_dims = in_features.shape[:-2]  # All dimensions except seq_len and d_model
+    seq_len = in_features.shape[-2]
+
+    # [..., seq_len, d_model] -> [..., seq_len, num_heads, d_k] -> [..., num_heads, seq_len, d_k]
+    Q = Q.view(*batch_dims, seq_len, num_heads, d_k).transpose(-3, -2)
+    K = K.view(*batch_dims, seq_len, num_heads, d_k).transpose(-3, -2)
+    V = V.view(*batch_dims, seq_len, num_heads, d_k).transpose(-3, -2)
+
+    # Apply RoPE to Q and K
+    if token_positions is None:
+        token_positions = torch.arange(seq_len, device=in_features.device)
+        # Expand for batch dimensions
+        token_positions = token_positions.expand(*batch_dims, seq_len)
+
+    # Apply RoPE to Q and K
+    # Q: [..., num_heads, seq_len, d_k]
+    # We need to apply RoPE per head, so reshape temporarily
+    original_shape = Q.shape
+    # Flatten batch and head dimensions for RoPE: [..., num_heads, seq_len, d_k] -> [-1, seq_len, d_k]
+    Q_flat = Q.reshape(-1, seq_len, d_k)
+    K_flat = K.reshape(-1, seq_len, d_k)
+
+    # token_positions: [..., seq_len] needs to be expanded for num_heads
+    # [..., seq_len] -> [..., 1, seq_len] -> [..., num_heads, seq_len] -> [-1, seq_len]
+    pos_expanded = token_positions.unsqueeze(-2).expand(*batch_dims, num_heads, seq_len)
+    pos_flat = pos_expanded.reshape(-1, seq_len)
+
+    Q_rope = run_rope(d_k, theta, max_seq_len, Q_flat, pos_flat)
+    K_rope = run_rope(d_k, theta, max_seq_len, K_flat, pos_flat)
+
+    # Reshape back
+    Q = Q_rope.view(*original_shape)
+    K = K_rope.view(*original_shape)
+
+    # Create causal mask (self-attention)
+    causal_mask = torch.tril(
+        torch.ones(seq_len, seq_len, dtype=torch.bool, device=in_features.device)
+    )
+
+    # Apply scaled dot product attention
+    attn_output = run_scaled_dot_product_attention(Q, K, V, mask=causal_mask)
+
+    # Reshape back: [..., num_heads, seq_len, d_k] -> [..., seq_len, d_model]
+    attn_output = attn_output.transpose(-3, -2).contiguous()
+    attn_output = attn_output.view(*batch_dims, seq_len, d_model)
+
+    # Output projection
+    output = torch.matmul(attn_output, o_proj_weight.T)
+
+    return output
 
 
 def run_rope(
@@ -205,7 +340,54 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    # Precompute sin/cos cache for positions 0 to max_seq_len-1
+    # Shape: [max_seq_len, d_k/2]
+    half_dim = d_k // 2
+    freqs = 1.0 / (
+        theta
+        ** (
+            torch.arange(0, d_k, 2, dtype=torch.float32, device=in_query_or_key.device)
+            / d_k
+        )
+    )
+    positions = torch.arange(
+        max_seq_len, dtype=torch.float32, device=in_query_or_key.device
+    )
+    # Shape: [max_seq_len, d_k/2]
+    angles = torch.outer(positions, freqs)
+
+    cos_cache = torch.cos(angles)  # [max_seq_len, d_k/2]
+    sin_cache = torch.sin(angles)  # [max_seq_len, d_k/2]
+
+    # Get sin/cos for the given token_positions
+    # token_positions: [..., sequence_length]
+    # Need to index into cos_cache and sin_cache
+    original_shape = token_positions.shape
+    pos_flat = token_positions.flatten()  # Flatten batch dimensions
+
+    cos_pos = cos_cache[pos_flat]  # [prod(batch), d_k/2]
+    sin_pos = sin_cache[pos_flat]  # [prod(batch), d_k/2]
+
+    # Reshape back to [..., sequence_length, d_k/2]
+    batch_shape = original_shape
+    cos_pos = cos_pos.view(*batch_shape, half_dim)
+    sin_pos = sin_pos.view(*batch_shape, half_dim)
+
+    # Split input into even and odd dimensions
+    x = in_query_or_key.float()
+    x1 = x[..., 0::2]  # [..., sequence_length, d_k/2] - even indices
+    x2 = x[..., 1::2]  # [..., sequence_length, d_k/2] - odd indices
+
+    # Apply rotation
+    # [x1*cos - x2*sin, x1*sin + x2*cos]
+    rotated_x1 = x1 * cos_pos - x2 * sin_pos
+    rotated_x2 = x1 * sin_pos + x2 * cos_pos
+
+    # Interleave back
+    output = torch.stack([rotated_x1, rotated_x2], dim=-1)
+    output = output.flatten(-2)  # [..., sequence_length, d_k]
+
+    return output.to(in_query_or_key.dtype)
 
 
 def run_transformer_block(
@@ -278,7 +460,56 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    # Pre-norm Transformer block:
+    # y = x + MultiHeadSelfAttention(RMSNorm(x))
+    # z = y + SwiGLU(RMSNorm(y))
+
+    seq_len = in_features.shape[1]
+
+    # First sublayer: Attention with residual
+    # RMSNorm
+    normed1 = run_rmsnorm(d_model, 1e-5, weights["ln1.weight"], in_features)
+
+    # Create token positions
+    token_positions = torch.arange(seq_len, device=in_features.device).expand(
+        in_features.shape[0], seq_len
+    )
+
+    # Multi-head self-attention with RoPE
+    attn_output = run_multihead_self_attention_with_rope(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,
+        theta=theta,
+        q_proj_weight=weights["attn.q_proj.weight"],
+        k_proj_weight=weights["attn.k_proj.weight"],
+        v_proj_weight=weights["attn.v_proj.weight"],
+        o_proj_weight=weights["attn.output_proj.weight"],
+        in_features=normed1,
+        token_positions=token_positions,
+    )
+
+    # Residual connection
+    y = in_features + attn_output
+
+    # Second sublayer: FFN with residual
+    # RMSNorm
+    normed2 = run_rmsnorm(d_model, 1e-5, weights["ln2.weight"], y)
+
+    # SwiGLU FFN
+    ffn_output = run_swiglu(
+        d_model=d_model,
+        d_ff=d_ff,
+        w1_weight=weights["ffn.w1.weight"],
+        w2_weight=weights["ffn.w2.weight"],
+        w3_weight=weights["ffn.w3.weight"],
+        in_features=normed2,
+    )
+
+    # Residual connection
+    z = y + ffn_output
+
+    return z
 
 
 def run_transformer_lm(
@@ -360,7 +591,53 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    # Get embeddings
+    # token_embeddings.weight: [vocab_size, d_model]
+    # in_indices: [batch_size, seq_len]
+    # x: [batch_size, seq_len, d_model]
+    x = run_embedding(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        weights=weights["token_embeddings.weight"],
+        token_ids=in_indices,
+    )
+
+    # Process through each transformer layer
+    for layer_idx in range(num_layers):
+        # Build weights dict for this layer
+        layer_weights = {}
+        prefix = f"layers.{layer_idx}."
+        for key in weights:
+            if key.startswith(prefix):
+                layer_weights[key.replace(prefix, "")] = weights[key]
+
+        # Apply transformer block
+        x = run_transformer_block(
+            d_model=d_model,
+            num_heads=num_heads,
+            d_ff=d_ff,
+            max_seq_len=context_length,
+            theta=rope_theta,
+            weights=layer_weights,
+            in_features=x,
+        )
+
+    # Final RMSNorm
+    x = run_rmsnorm(d_model, 1e-5, weights["ln_final.weight"], x)
+
+    # Output projection (lm_head)
+    # lm_head.weight: [vocab_size, d_model]
+    # We need: x @ lm_head.weight.T -> [batch_size, seq_len, vocab_size]
+    # But run_linear expects weights as [d_out, d_in]
+    # lm_head.weight is [vocab_size, d_model] which is [d_out, d_in]
+    logits = run_linear(
+        d_in=d_model,
+        d_out=vocab_size,
+        weights=weights["lm_head.weight"],
+        in_features=x,
+    )
+
+    return logits
 
 
 def run_rmsnorm(
@@ -383,7 +660,18 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    # Promote to float32 for numerical stability
+    original_dtype = in_features.dtype
+    x = in_features.float()
+
+    # RMS(x) = sqrt(1/d_model * sum(x_i^2) + eps)
+    rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + eps)
+
+    # Normalize and scale
+    output = (x / rms) * weights.float()
+
+    # Return to original dtype
+    return output.to(original_dtype)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -397,7 +685,8 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    # SiLU(x) = x * sigmoid(x)
+    return in_features * torch.sigmoid(in_features)
 
 
 def run_get_batch(
@@ -436,7 +725,12 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    # Numerically stable softmax: subtract max for stability
+    max_val = torch.max(in_features, dim=dim, keepdim=True).values
+    shifted = in_features - max_val
+    exp_shifted = torch.exp(shifted)
+    sum_exp = torch.sum(exp_shifted, dim=dim, keepdim=True)
+    return exp_shifted / sum_exp
 
 
 def run_cross_entropy(
