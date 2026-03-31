@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections import Counter
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
+import numpy as np
 import numpy.typing as npt
 import regex
 import torch
@@ -709,7 +711,31 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    # Maximum starting index: need to have context_length + 1 tokens (input + next token)
+    max_start_idx = len(dataset) - context_length - 1
+
+    if max_start_idx < 0:
+        raise ValueError(
+            f"Dataset too small for context_length {context_length}: "
+            f"need at least {context_length + 1} tokens, got {len(dataset)}"
+        )
+
+    # Random starting indices for each batch element
+    start_indices = np.random.randint(0, max_start_idx + 1, size=batch_size)
+
+    # Build x and y sequences with pre-allocated arrays (memory-efficient for memmap)
+    # x: [batch_size, context_length] starting from start_indices
+    # y: [batch_size, context_length] starting from start_indices + 1
+    x = np.empty((batch_size, context_length), dtype=dataset.dtype)
+    y = np.empty((batch_size, context_length), dtype=dataset.dtype)
+    for i, idx in enumerate(start_indices):
+        x[i] = dataset[idx : idx + context_length]
+        y[i] = dataset[idx + 1 : idx + context_length + 1]
+
+    # Convert to tensors and move to device
+    return torch.from_numpy(x).to(device=device, dtype=torch.long), torch.from_numpy(
+        y
+    ).to(device=device, dtype=torch.long)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -748,7 +774,29 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    # Numerically stable cross-entropy:
+    # ℓ_i = -log(softmax(o_i)[x_{i+1}])
+    # = -log(exp(o_i[target]) / sum_j exp(o_j))
+    # = -o_i[target] + log(sum_j exp(o_j))
+
+    # For numerical stability, subtract max from logits
+    # log(sum_j exp(o_j - max)) + max = log(sum_j exp(o_j))
+    max_logits = inputs.max(dim=-1, keepdim=True).values
+    shifted_logits = inputs - max_logits
+
+    # log(sum_j exp(shifted_logits))
+    log_sum_exp = shifted_logits.exp().sum(dim=-1).log()
+
+    # Get the logit for the target class using gather (handles arbitrary batch dims)
+    target_logits = shifted_logits.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(
+        -1
+    )
+
+    # Cross-entropy: -target_logits + log_sum_exp
+    loss_per_example = -target_logits + log_sum_exp
+
+    # Return average loss
+    return loss_per_example.mean()
 
 
 def run_gradient_clipping(
@@ -762,14 +810,103 @@ def run_gradient_clipping(
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    # Collect all gradients into a single vector and compute total L2 norm
+    total_norm = 0.0
+    for param in parameters:
+        if param.grad is not None:
+            total_norm += param.grad.data.pow(2).sum()
+    total_norm = total_norm.sqrt().item()
+
+    # Clip if necessary
+    if total_norm > max_l2_norm:
+        clip_coef = max_l2_norm / (total_norm + 1e-6)
+        for param in parameters:
+            if param.grad is not None:
+                param.grad.data.mul_(clip_coef)
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+
+    class AdamW(torch.optim.Optimizer):
+        """AdamW optimizer implementation following the paper's Algorithm 2."""
+
+        def __init__(
+            self,
+            params,
+            lr: float = 1e-3,
+            betas: tuple[float, float] = (0.9, 0.999),
+            eps: float = 1e-8,
+            weight_decay: float = 0.01,
+        ):
+            if lr < 0:
+                raise ValueError(f"Invalid learning rate: {lr}")
+            if eps < 0:
+                raise ValueError(f"Invalid epsilon value: {eps}")
+            if betas[0] < 0 or betas[1] < 0:
+                raise ValueError(f"Invalid beta values: {betas}")
+            if weight_decay < 0:
+                raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+
+            defaults = {
+                "lr": lr,
+                "betas": betas,
+                "eps": eps,
+                "weight_decay": weight_decay,
+            }
+            super().__init__(params, defaults)
+
+        def step(self, closure=None):
+            """Perform a single optimization step."""
+            loss = None if closure is None else closure()
+
+            for group in self.param_groups:
+                lr = group["lr"]
+                beta1, beta2 = group["betas"]
+                eps = group["eps"]
+                weight_decay = group["weight_decay"]
+
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+
+                    grad = p.grad.data
+                    state = self.state[p]
+
+                    # State initialization
+                    if len(state) == 0:
+                        state["t"] = 0
+                        state["m"] = torch.zeros_like(p.data)
+                        state["v"] = torch.zeros_like(p.data)
+
+                    state["t"] += 1
+                    t = state["t"]
+                    m = state["m"]
+                    v = state["v"]
+
+                    # Update biased first moment estimate: m_t = β₁ * m_{t-1} + (1 - β₁) * g_t
+                    m.mul_(beta1).add_(grad, alpha=1 - beta1)
+
+                    # Update biased second raw moment estimate: v_t = β₂ * v_{t-1} + (1 - β₂) * g_t²
+                    v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                    # Compute bias-corrected estimates: m̂_t = m_t / (1 - β₁^t), v̂_t = v_t / (1 - β₂^t)
+                    bias_correction1 = 1 - beta1**t
+                    bias_correction2 = 1 - beta2**t
+                    step_size = lr / bias_correction1
+                    denom = v.sqrt().add_(eps) / math.sqrt(bias_correction2)
+
+                    # Parameter update with weight decay (AdamW style):
+                    # θ_t = θ_{t-1} - α * m̂_t / (√v̂_t + ε) - α * λ * θ_{t-1}
+                    # Weight decay must use the ORIGINAL parameter value
+                    p.data.mul_(1 - lr * weight_decay)
+                    p.data.addcdiv_(m, denom, value=-step_size)
+
+            return loss
+
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -797,7 +934,23 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    import math
+
+    # Phase 1: Linear warmup
+    if it < warmup_iters:
+        return max_learning_rate * (it / warmup_iters)
+
+    # Phase 2: Cosine annealing
+    if it < cosine_cycle_iters:
+        # Progress through the cosine cycle (0 to 1)
+        progress = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+        # Cosine decay from max to min
+        return min_learning_rate + 0.5 * (max_learning_rate - min_learning_rate) * (
+            1 + math.cos(math.pi * progress)
+        )
+
+    # Phase 3: Return minimum learning rate after cosine cycle
+    return min_learning_rate
 
 
 def run_save_checkpoint(
@@ -816,7 +969,12 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "iteration": iteration,
+    }
+    torch.save(checkpoint, out)
 
 
 def run_load_checkpoint(
@@ -837,7 +995,10 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    checkpoint = torch.load(src, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    return checkpoint["iteration"]
 
 
 def get_tokenizer(
@@ -1114,50 +1275,81 @@ def run_train_bpe(
         text = f.read()
 
     # Split on special tokens and pretokenize each part
-    parts = split_on_special_tokens(text, special_tokens)
-    tokens_list: list[list[bytes]] = []
+    # Use word frequencies: unique words with counts
+    word_freqs: dict[tuple[bytes, ...], int] = Counter()
 
+    parts = split_on_special_tokens(text, special_tokens)
     for part in parts:
         if part in special_token_set:
-            # Special token: keep as single token
-            tokens_list.append([part.encode("utf-8")])
-        elif part:  # Non-empty non-special text
-            # Regular text: pretokenize and convert to bytes
+            continue
+        elif part:
             for word in pretokenize(part):
-                # Convert each character to its byte representation
-                tokens_list.append([bytes([b]) for b in word.encode("utf-8")])
+                word_bytes = tuple(bytes([b]) for b in word.encode("utf-8"))
+                word_freqs[word_bytes] += 1
 
     merges: list[tuple[bytes, bytes]] = []
 
+    # Build initial pair counts with frequencies
+    pair_counts: Counter[tuple[bytes, bytes]] = Counter()
+    for word, freq in word_freqs.items():
+        for i in range(len(word) - 1):
+            pair_counts[(word[i], word[i + 1])] += freq
+
     # Step 3: BPE training loop
     while len(vocab) < vocab_size:
-        # Count pair frequencies
-        pair_counts: Counter[tuple[bytes, bytes]] = Counter()
-        for tokens in tokens_list:
-            for i in range(len(tokens) - 1):
-                pair = (tokens[i], tokens[i + 1])
-                pair_counts[pair] += 1
-
         if not pair_counts:
             break
 
         # Select highest frequency pair (with lexicographically larger as tiebreaker)
         best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
 
+        if pair_counts[best_pair] == 0:
+            break
+
         # Create new token by merging
         new_token = best_pair[0] + best_pair[1]
         vocab[len(vocab)] = new_token
         merges.append(best_pair)
 
-        # Update tokens by merging all occurrences of best_pair
-        for tokens in tokens_list:
+        # Remove best_pair from counts
+        del pair_counts[best_pair]
+
+        # Process all words - merge and update counts incrementally
+        new_word_freqs: dict[tuple[bytes, ...], int] = {}
+        for word, freq in word_freqs.items():
+            # Convert to list for merging
+            tokens = list(word)
             i = 0
             while i < len(tokens) - 1:
                 if (tokens[i], tokens[i + 1]) == best_pair:
-                    # Merge the pair
+                    # Remove old pairs around this position
+                    if i > 0:
+                        left_pair = (tokens[i - 1], tokens[i])
+                        pair_counts[left_pair] -= freq
+                        if pair_counts[left_pair] <= 0:
+                            pair_counts.pop(left_pair, None)
+                    if i + 2 < len(tokens):
+                        right_pair = (tokens[i + 1], tokens[i + 2])
+                        pair_counts[right_pair] -= freq
+                        if pair_counts[right_pair] <= 0:
+                            pair_counts.pop(right_pair, None)
+
+                    # Perform merge
                     tokens[i : i + 2] = [new_token]
-                    # Don't increment i - check if the new token can merge again
+
+                    # Add new pairs around the merged token
+                    if i > 0:
+                        left_pair = (tokens[i - 1], new_token)
+                        pair_counts[left_pair] += freq
+                    if i + 1 < len(tokens):
+                        right_pair = (new_token, tokens[i + 1])
+                        pair_counts[right_pair] += freq
+                    # Don't increment i - check if new token can merge again
                 else:
                     i += 1
+
+            new_word_freqs[tuple(tokens)] = freq
+
+        word_freqs = new_word_freqs
 
     return vocab, merges
