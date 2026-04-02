@@ -53,7 +53,9 @@ def test_train_bpe():
     with open(reference_vocab_path, encoding="utf-8") as f:
         gpt2_reference_vocab = json.load(f)
         reference_vocab = {
-            gpt2_vocab_index: bytes([gpt2_byte_decoder[token] for token in gpt2_vocab_item])
+            gpt2_vocab_index: bytes(
+                [gpt2_byte_decoder[token] for token in gpt2_vocab_item]
+            )
             for gpt2_vocab_item, gpt2_vocab_index in gpt2_reference_vocab.items()
         }
     # Rather than checking that the vocabs exactly match (since they could
@@ -75,7 +77,9 @@ def test_train_bpe_special_tokens(snapshot):
     )
 
     # Check that the special token is not in the vocab
-    vocabs_without_specials = [word for word in vocab.values() if word != b"<|endoftext|>"]
+    vocabs_without_specials = [
+        word for word in vocab.values() if word != b"<|endoftext|>"
+    ]
     for word_bytes in vocabs_without_specials:
         assert b"<|" not in word_bytes
 
@@ -86,3 +90,88 @@ def test_train_bpe_special_tokens(snapshot):
             "merges": merges,
         },
     )
+
+
+def test_train_bpe_parallel_consistency():
+    """
+    Ensure that parallel BPE training produces identical results to sequential.
+    """
+    input_path = FIXTURES_PATH / "corpus.en"
+
+    # Sequential
+    vocab_seq, merges_seq = run_train_bpe(
+        input_path=input_path,
+        vocab_size=500,
+        special_tokens=[""],
+        num_workers=1,
+    )
+
+    # Parallel with 2 workers
+    vocab_par2, merges_par2 = run_train_bpe(
+        input_path=input_path,
+        vocab_size=500,
+        special_tokens=[""],
+        num_workers=2,
+    )
+
+    # Parallel with 4 workers
+    vocab_par4, merges_par4 = run_train_bpe(
+        input_path=input_path,
+        vocab_size=500,
+        special_tokens=[""],
+        num_workers=4,
+    )
+
+    # Parallel with 9 workers
+    vocab_par9, merges_par9 = run_train_bpe(
+        input_path=input_path,
+        vocab_size=500,
+        special_tokens=[""],
+        num_workers=9,
+    )
+
+    # All should produce identical results
+    assert (
+        merges_seq == merges_par2
+    ), "Sequential and parallel (2 workers) merges should match"
+    assert (
+        merges_seq == merges_par4
+    ), "Sequential and parallel (4 workers) merges should match"
+    assert (
+        merges_seq == merges_par9
+    ), "Sequential and parallel (9 workers) merges should match"
+    assert set(vocab_seq.keys()) == set(vocab_par2.keys()), "Vocab keys should match"
+    assert set(vocab_seq.values()) == set(
+        vocab_par2.values()
+    ), "Vocab values should match"
+    assert set(vocab_seq.keys()) == set(vocab_par4.keys()), "Vocab keys should match"
+    assert set(vocab_seq.values()) == set(
+        vocab_par4.values()
+    ), "Vocab values should match"
+    assert set(vocab_seq.keys()) == set(vocab_par9.keys()), "Vocab keys should match"
+    assert set(vocab_seq.values()) == set(
+        vocab_par9.values()
+    ), "Vocab values should match"
+
+
+def test_train_bpe_parallel_speed():
+    """
+    Ensure that parallel BPE training is reasonably efficient.
+    The parallel version should complete within a reasonable time.
+    """
+    input_path = FIXTURES_PATH / "tinystories_sample_5M.txt"
+
+    # Test parallel version speed (with 4 workers)
+    start_time = time.time()
+    run_train_bpe(
+        input_path=input_path,
+        vocab_size=1000,
+        special_tokens=[""],
+        num_workers=8,
+    )
+    end_time = time.time()
+
+    # Should complete within 10 seconds on the sample file
+    assert (
+        end_time - start_time < 10.0
+    ), f"Parallel BPE took too long: {end_time - start_time:.2f}s"

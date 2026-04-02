@@ -13,6 +13,7 @@ import regex
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from tqdm import tqdm
 
 from .common import gpt2_bytes_to_unicode
 
@@ -1218,10 +1219,113 @@ def get_tokenizer(
     return Tokenizer(vocab, merges, special_tokens)
 
 
+class BPETrainer:
+    """BPE Trainer class that handles tokenization and training logic."""
+
+    # GPT-2 pretokenization pattern (class-level for efficiency)
+    _PATTERN = regex.compile(
+        r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    )
+
+    def __init__(self, special_tokens: list[str]):
+        """Initialize the BPE trainer.
+
+        Args:
+            special_tokens: List of special tokens that should not be split.
+        """
+        self.special_tokens = special_tokens
+        self.special_token_set = set(special_tokens)
+
+    def pretokenize(self, text: str) -> list[str]:
+        """Split text into tokens using GPT-2 regex pattern."""
+        return self._PATTERN.findall(text)
+
+    def split_on_special_tokens(self, text: str) -> list[str]:
+        """Split text on special token boundaries."""
+        if not self.special_tokens:
+            return [text] if text else []
+        pattern = "|".join(map(regex.escape, self.special_tokens))
+        parts = regex.split(f"({pattern})", text)
+        return [p for p in parts if p]
+
+    def find_chunk_boundaries(
+        self,
+        file_path: str,
+        num_chunks: int,
+    ) -> list[int]:
+        """Find chunk boundaries aligned to newlines.
+
+        Returns positions where each position is at the start of a valid UTF-8
+        character (after a newline).
+        """
+        import os
+
+        file_size = os.path.getsize(file_path)
+
+        # Read the entire file to find all newline positions
+        with open(file_path, "rb") as f:
+            data = f.read()
+
+        # Find all newline positions
+        newline_positions = [i + 1 for i, b in enumerate(data) if b == ord(b"\n")]
+
+        # Build boundaries: start at 0, then use newline positions that are
+        # approximately evenly spaced
+        boundaries = [0]
+
+        target_chunk_size = file_size // num_chunks
+        next_target = target_chunk_size
+
+        for nl_pos in newline_positions:
+            if nl_pos >= next_target:
+                boundaries.append(nl_pos)
+                next_target = boundaries[-1] + target_chunk_size
+
+        # Always include file end
+        boundaries.append(file_size)
+
+        return boundaries
+
+    def count_words(self, text: str) -> dict[tuple[bytes, ...], int]:
+        """Count word frequencies in text."""
+        word_freqs: dict[tuple[bytes, ...], int] = Counter()
+
+        parts = self.split_on_special_tokens(text)
+        for part in parts:
+            if part in self.special_token_set:
+                continue
+            elif part:
+                for word in self.pretokenize(part):
+                    word_bytes = tuple(bytes([b]) for b in word.encode("utf-8"))
+                    word_freqs[word_bytes] += 1
+
+        return word_freqs
+
+
+# Module-level function for multiprocessing (must be picklable)
+def _process_chunk_bpe(args: tuple) -> dict[tuple[bytes, ...], int]:
+    """Process a single chunk and return word frequencies (for multiprocessing)."""
+    input_path, start, end, special_tokens = args
+
+    # Open in binary mode
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        # Read the chunk (boundaries are aligned to newlines)
+        text_bytes = f.read(end - start)
+
+    # Decode the text - boundaries are at newline positions, so UTF-8 is safe
+    text = text_bytes.decode("utf-8")
+
+    # Use a temporary trainer for this chunk
+    trainer = BPETrainer(special_tokens)
+    return trainer.count_words(text)
+
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
+    num_workers: int = 1,
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """Given the path to an input corpus, run train a BPE tokenizer and
@@ -1234,6 +1338,7 @@ def run_train_bpe(
             These strings will never be split into multiple tokens, and will always be
             kept as a single token. If these special tokens occur in the `input_path`,
             they are treated as any other string.
+        num_workers (int): Number of parallel workers for pretokenization.
 
     Returns:
         tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
@@ -1245,58 +1350,87 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    # GPT-2 pretokenization pattern
-    GPT2_PATTERN = regex.compile(
-        r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    )
-
-    def pretokenize(text: str) -> list[str]:
-        """Split text into tokens using GPT-2 regex pattern."""
-        return GPT2_PATTERN.findall(text)
-
-    def split_on_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
-        """Split text on special token boundaries."""
-        # Build regex pattern to match any special token
-        pattern = "|".join(map(regex.escape, special_tokens))
-        # Split and keep delimiters
-        parts = regex.split(f"({pattern})", text)
-        return [p for p in parts if p]
+    # Create BPE trainer instance
+    trainer = BPETrainer(special_tokens)
 
     # Step 1: Initialize vocabulary with 256 byte values
     vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
 
     # Add special tokens to vocab
-    special_token_set = set(special_tokens)
     for tok in special_tokens:
         vocab[len(vocab)] = tok.encode("utf-8")
 
-    # Step 2: Read and preprocess the training text
-    with open(input_path, "r", encoding="utf-8") as f:
-        text = f.read()
+    # Step 2: Parallel pretokenization (only if num_workers > 1)
+    if num_workers > 1:
+        print("  Parallel pretokenization...")
 
-    # Split on special tokens and pretokenize each part
-    # Use word frequencies: unique words with counts
-    word_freqs: dict[tuple[bytes, ...], int] = Counter()
+        # Use more chunks than workers for better load balancing
+        num_chunks = num_workers * 512
+        boundaries = trainer.find_chunk_boundaries(input_path, num_chunks)
 
-    parts = split_on_special_tokens(text, special_tokens)
-    for part in parts:
-        if part in special_token_set:
-            continue
-        elif part:
-            for word in pretokenize(part):
-                word_bytes = tuple(bytes([b]) for b in word.encode("utf-8"))
-                word_freqs[word_bytes] += 1
+        # Create chunk arguments (include input_path for multiprocessing)
+        chunks = []
+        for i in range(len(boundaries) - 1):
+            chunks.append(
+                (input_path, boundaries[i], boundaries[i + 1], special_tokens)
+            )
+
+        # Process chunks in parallel using ProcessPoolExecutor
+        # Note: Use ProcessPoolExecutor for true parallelism due to Python's GIL
+        from concurrent.futures import ProcessPoolExecutor
+
+        all_word_freqs: list[dict[tuple[bytes, ...], int]] = []
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            results = list(
+                tqdm(
+                    executor.map(_process_chunk_bpe, chunks),
+                    total=len(chunks),
+                    desc="  Processing chunks",
+                )
+            )
+
+        # Merge results
+        word_freqs: dict[tuple[bytes, ...], int] = Counter()
+        for result in results:
+            word_freqs.update(result)
+
+        print(f"  Unique words: {len(word_freqs):,}")
+    else:
+        # Sequential processing (original single-threaded implementation)
+        print("  Sequential pretokenization...")
+
+        # Step 2: Read and preprocess the training text
+        with open(input_path, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        # Use trainer to count words
+        word_freqs = trainer.count_words(text)
+
+        print(f"  Unique words: {len(word_freqs):,}")
 
     merges: list[tuple[bytes, bytes]] = []
 
     # Build initial pair counts with frequencies
+    print("  Building initial pair counts...")
     pair_counts: Counter[tuple[bytes, bytes]] = Counter()
+    # pair_to_words: maps each pair to the set of words containing it
+    pair_to_words: dict[tuple[bytes, bytes], set[tuple[bytes, ...]]] = {}
     for word, freq in word_freqs.items():
-        for i in range(len(word) - 1):
-            pair_counts[(word[i], word[i + 1])] += freq
+        word_len = len(word)
+        for i in range(word_len - 1):
+            pair = (word[i], word[i + 1])
+            pair_counts[pair] += freq
+            if pair not in pair_to_words:
+                pair_to_words[pair] = set()
+            pair_to_words[pair].add(word)
 
-    # Step 3: BPE training loop
-    while len(vocab) < vocab_size:
+    # Step 3: BPE training loop with optimization
+    initial_vocab_size = len(vocab)
+    num_merges_needed = vocab_size - initial_vocab_size
+
+    print(f"  Starting BPE training loop ({num_merges_needed} merges)...")
+
+    for merge_idx in tqdm(range(num_merges_needed), desc="Training BPE"):
         if not pair_counts:
             break
 
@@ -1311,18 +1445,26 @@ def run_train_bpe(
         vocab[len(vocab)] = new_token
         merges.append(best_pair)
 
-        # Remove best_pair from counts
+        # Remove best_pair from counts and index
         del pair_counts[best_pair]
+        words_to_process = pair_to_words.pop(best_pair, set())
 
-        # Process all words - merge and update counts incrementally
-        new_word_freqs: dict[tuple[bytes, ...], int] = {}
-        for word, freq in word_freqs.items():
-            # Convert to list for merging
-            tokens = list(word)
+        # Only process words that contain the best_pair
+        for old_word in list(words_to_process):
+            freq = word_freqs.get(old_word)
+            if freq is None:
+                continue
+
+            # Check if old_word still contains best_pair (might have been modified)
+            # by a previous iteration on the same word
+            tokens = list(old_word)
             i = 0
+            changed = False
             while i < len(tokens) - 1:
                 if (tokens[i], tokens[i + 1]) == best_pair:
-                    # Remove old pairs around this position
+                    changed = True
+                    # Remove old pairs around this position from global counts
+                    # Note: pair_to_words will be updated after all merges in this word
                     if i > 0:
                         left_pair = (tokens[i - 1], tokens[i])
                         pair_counts[left_pair] -= freq
@@ -1337,7 +1479,7 @@ def run_train_bpe(
                     # Perform merge
                     tokens[i : i + 2] = [new_token]
 
-                    # Add new pairs around the merged token
+                    # Add new pairs around the merged token to counts
                     if i > 0:
                         left_pair = (tokens[i - 1], new_token)
                         pair_counts[left_pair] += freq
@@ -1348,8 +1490,25 @@ def run_train_bpe(
                 else:
                     i += 1
 
-            new_word_freqs[tuple(tokens)] = freq
+            if changed:
+                new_word = tuple(tokens)
 
-        word_freqs = new_word_freqs
+                # First, remove old_word from all its pairs in pair_to_words
+                # This cleans up stale references from pairs that weren't involved in this merge
+                for j in range(len(old_word) - 1):
+                    p = (old_word[j], old_word[j + 1])
+                    if p in pair_to_words:
+                        pair_to_words[p].discard(old_word)
+
+                # Update word_freqs: remove old word, add new word
+                del word_freqs[old_word]
+                word_freqs[new_word] = freq
+
+                # Add new_word to all its pairs in pair_to_words
+                for j in range(len(new_word) - 1):
+                    p = (new_word[j], new_word[j + 1])
+                    if p not in pair_to_words:
+                        pair_to_words[p] = set()
+                    pair_to_words[p].add(new_word)
 
     return vocab, merges
