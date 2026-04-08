@@ -14,11 +14,10 @@ from pathlib import Path
 
 import torch
 
+# Import model from cs336_basics and generate function from train
+from cs336_basics.model import TransformerLM
 from tests.adapters import get_tokenizer
 from tests.common import gpt2_bytes_to_unicode
-
-# Import train module for TransformerLM and generate function
-from train import TransformerLM
 from train import generate as generate_tokens
 
 
