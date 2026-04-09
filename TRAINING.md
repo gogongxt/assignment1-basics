@@ -19,7 +19,7 @@ wget https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinySto
 cd ..
 
 # Tokenize data (train BPE tokenizer and tokenize files)
-uv run python tokenize_data.py \
+uv run python -m cs336_basics.tokenize_data \
     --train_text data/TinyStoriesV2-GPT4-train.txt \
     --valid_text data/TinyStoriesV2-GPT4-valid.txt \
     --output_dir data \
@@ -79,7 +79,7 @@ This will create:
 Basic training:
 
 ```bash
-uv run python train.py \
+uv run python -m cs336_basics.train \
     --train_data data/train.npy \
     --valid_data data/valid.npy \
     --vocab_size 10000 \
@@ -203,7 +203,7 @@ Training Complete!
 After training, generate text from the model:
 
 ```bash
-uv run python generate.py \
+uv run python -m cs336_basics.generate \
     --checkpoint checkpoints/final.pt \
     --config_path checkpoints/config.json \
     --vocab_path data/vocab.json \
@@ -237,7 +237,7 @@ Lily took the apple home and showed it to her mom. Her mom said, "Good job, Lily
 Run learning rate tuning experiments:
 
 ```bash
-uv run python run_experiments.py \
+uv run python -m cs336_basics.run_experiments \
     --experiment lr_sweep \
     --learning_rates 1e-4 3e-4 1e-3 3e-3 \
     --train_data data/train.npy \
@@ -250,7 +250,7 @@ uv run python run_experiments.py \
 Run batch size experiments:
 
 ```bash
-uv run python run_experiments.py \
+uv run python -m cs336_basics.run_experiments \
     --experiment batch_sweep \
     --batch_sizes 16 32 64 128 \
     --train_data data/train.npy \
@@ -262,7 +262,7 @@ uv run python run_experiments.py \
 Run a single training with specific parameters:
 
 ```bash
-uv run python run_experiments.py \
+uv run python -m cs336_basics.run_experiments \
     --experiment single \
     --learning_rate 3e-4 \
     --batch_size 64 \
@@ -274,7 +274,7 @@ uv run python run_experiments.py \
 For training on CPU or Apple Silicon:
 
 ```bash
-uv run python train.py \
+uv run python -m cs336_basics.train \
     --train_data data/train.npy \
     --valid_data data/valid.npy \
     --batch_size 32 \
@@ -317,7 +317,7 @@ checkpoints/
 To resume training:
 
 ```bash
-uv run python train.py --resume checkpoints/step_1000.pt
+uv run python -m cs336_basics.train --resume checkpoints/step_1000.pt
 ```
 
 ## Hyperparameter Guidelines
@@ -354,7 +354,7 @@ Based on the assignment guidelines:
 1. **Overfit a single batch first** to verify implementation:
 
    ```bash
-   uv run python train.py --total_steps 100 --eval_interval 10
+   uv run python -m cs336_basics.train --total_steps 100 --eval_interval 10
    ```
 
 2. **Monitor gradients** - if gradients explode/vanish, check:
@@ -370,5 +370,5 @@ Based on the assignment guidelines:
 
 5. **MPS acceleration** on Apple Silicon:
    ```bash
-   uv run python train.py --device mps
+   uv run python -m cs336_basics.train --device mps
    ```

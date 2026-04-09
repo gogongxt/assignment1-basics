@@ -42,7 +42,7 @@ def run_training(args: dict[str, Any], experiment_dir: str) -> str:
         Path to checkpoint
     """
     # Build command
-    cmd = [sys.executable, "train.py"]
+    cmd = [sys.executable, "-m", "cs336_basics.train"]
 
     for key, value in args.items():
         # Use the key as-is (argparse uses snake_case by default)
